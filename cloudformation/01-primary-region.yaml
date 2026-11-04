@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
-  DBBLOG-5791 - Primary Region setup for testing Aurora Global Database headless
+  Primary Region setup for testing Aurora Global Database headless
   secondary DR with AWS FIS. Creates an isolated VPC, three private subnets, SSM
   interface endpoints + S3 gateway endpoint, an SSM-managed access instance, the
   Aurora global cluster, the primary regional cluster and writer instance, and
@@ -95,7 +95,7 @@ Resources:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
       DBSubnetGroupName: dbblog-5791-primary-subnets
-      DBSubnetGroupDescription: DBBLOG-5791 primary
+      DBSubnetGroupDescription: Aurora primary cluster private subnets
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
 
   # ---------- Security groups ----------
@@ -202,7 +202,7 @@ Resources:
   DBMasterSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Description: DBBLOG-5791 Aurora primary cluster admin credentials
+      Description: Aurora primary cluster admin credentials
       GenerateSecretString:
         SecretStringTemplate: !Sub '{"username": "${MasterUsername}"}'
         GenerateStringKey: password

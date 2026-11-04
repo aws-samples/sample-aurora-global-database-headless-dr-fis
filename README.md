@@ -1,7 +1,7 @@
 # Test Aurora Global Database headless secondary DR with AWS FIS
 
 Sample code accompanying the AWS Database Blog post **"Test Aurora Global
-Database headless secondary DR with AWS FIS"** (DBBLOG-5791). This repository
+Database headless secondary DR with AWS FIS"**. This repository
 demonstrates the setup used in the post; it is sample code tied to the blog and
 is not a supported product or library.
 

@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
-  DBBLOG-5791 - Secondary (headless) Region setup for testing Aurora Global
+  Secondary (headless) Region setup for testing Aurora Global
   Database DR with AWS FIS. Creates an isolated VPC, three private subnets, SSM
   interface endpoints + S3 gateway endpoint, an SSM-managed access instance, and
   the headless secondary cluster (NO DB instance) attached to the existing global
@@ -81,7 +81,7 @@ Resources:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
       DBSubnetGroupName: dbblog-5791-secondary-subnets
-      DBSubnetGroupDescription: DBBLOG-5791 secondary
+      DBSubnetGroupDescription: Aurora headless secondary cluster private subnets
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
 
   # ---------- Security groups ----------
