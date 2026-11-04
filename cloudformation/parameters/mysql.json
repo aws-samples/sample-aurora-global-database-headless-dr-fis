@@ -1,0 +1,6 @@
+[
+  "Engine=aurora-mysql",
+  "EngineVersion=8.0.mysql_aurora.3.08.0",
+  "DBPort=3306",
+  "MasterUsername=admin"
+]

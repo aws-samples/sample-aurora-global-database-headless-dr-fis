@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  DBBLOG-5791 - Secondary (headless) Region setup for testing Aurora Global
+  Database DR with AWS FIS. Creates an isolated VPC, three private subnets, SSM
+  interface endpoints + S3 gateway endpoint, an SSM-managed access instance, and
+  the headless secondary cluster (NO DB instance) attached to the existing global
+  cluster. Deploy this stack in ap-south-1 AFTER 01-primary-region.yaml has
+  finished in us-east-1.
+
+Parameters:
+  Engine:
+    Type: String
+    Default: aurora-postgresql
+    AllowedValues: [aurora-postgresql, aurora-mysql]
+  EngineVersion:
+    Type: String
+    Default: '15.15'
+    Description: Must match the engine/version of the primary cluster.
+  DBPort:
+    Type: Number
+    Default: 5432
+    AllowedValues: [5432, 3306]
+    Description: 5432 for Aurora PostgreSQL, 3306 for Aurora MySQL.
+  GlobalClusterId:
+    Type: String
+    Default: dbblog-5791-global
+    Description: Same global cluster identifier created by the primary stack.
+  LatestAl2023Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+
+  # ---------- Networking (10.43.0.0/16) ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.43.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: dbblog-5791-secondary }]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.43.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: dbblog-5791-secondary-a }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.43.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{ Key: Name, Value: dbblog-5791-secondary-b }]
+  PrivateSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.43.3.0/24
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags: [{ Key: Name, Value: dbblog-5791-secondary-c }]
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: dbblog-5791-secondary-rtb }]
+  RouteAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable }
+  RouteAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable }
+  RouteAssocC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetC, RouteTableId: !Ref PrivateRouteTable }
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: dbblog-5791-secondary-subnets
+      DBSubnetGroupDescription: DBBLOG-5791 secondary
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+
+  # ---------- Security groups ----------
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: dbblog-5791-secondary-db-sg
+      GroupDescription: Aurora secondary DB - allow DB port within the VPC CIDR only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref DBPort
+          ToPort: !Ref DBPort
+          CidrIp: 10.43.0.0/16
+      Tags: [{ Key: Name, Value: dbblog-5791-secondary-db-sg }]
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: dbblog-5791-vpce-sg
+      GroupDescription: SSM interface endpoints - allow HTTPS from the VPC CIDR
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.43.0.0/16
+      Tags: [{ Key: Name, Value: dbblog-5791-vpce-sg }]
+
+  # ---------- VPC endpoints ----------
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PrivateDnsEnabled: true
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PrivateDnsEnabled: true
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PrivateDnsEnabled: true
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcId: !Ref Vpc
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  # ---------- IAM: SSM-managed access instance ----------
+  SsmInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dbblog-5791-ssm-ec2-role-sec
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  SsmInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: dbblog-5791-ssm-ec2-profile-sec
+      Roles: [!Ref SsmInstanceRole]
+
+  ValidateInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAl2023Ami
+      InstanceType: t3.micro
+      IamInstanceProfile: !Ref SsmInstanceProfile
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroupIds: [!Ref DBSecurityGroup]
+      Tags: [{ Key: Name, Value: dbblog-5791-validate }]
+
+  # ---------- Headless secondary cluster (NO instance) ----------
+  SecondaryCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DBClusterIdentifier: dbblog-5791-secondary
+      GlobalClusterIdentifier: !Ref GlobalClusterId
+      Engine: !Ref Engine
+      EngineVersion: !Ref EngineVersion
+      StorageEncrypted: true
+      # An encrypted cross-Region secondary needs a KMS key in its own Region.
+      # This uses the AWS managed RDS key; replace it with a customer managed
+      # key ARN if your security requirements call for one.
+      KmsKeyId: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/rds
+      EnableIAMDatabaseAuthentication: true
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds: [!Ref DBSecurityGroup]
+      # No AWS::RDS::DBInstance here on purpose: this is the headless secondary.
+      # You add compute in Step 6 (aws rds create-db-instance) during failover.
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+  SecondaryClusterArn:
+    Description: Pass this ARN to aws rds failover-global-cluster in Step 6.
+    Value: !GetAtt SecondaryCluster.DBClusterArn
+  ValidateInstanceId:
+    Description: SSM-managed instance for post-failover validation (Step 6).
+    Value: !Ref ValidateInstance

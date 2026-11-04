@@ -1,0 +1,6 @@
+[
+  "Engine=aurora-postgresql",
+  "EngineVersion=15.15",
+  "DBPort=5432",
+  "MasterUsername=postgres"
+]

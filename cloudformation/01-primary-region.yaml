@@ -1,0 +1,349 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  DBBLOG-5791 - Primary Region setup for testing Aurora Global Database headless
+  secondary DR with AWS FIS. Creates an isolated VPC, three private subnets, SSM
+  interface endpoints + S3 gateway endpoint, an SSM-managed access instance, the
+  Aurora global cluster, the primary regional cluster and writer instance, and
+  the AWS FIS role + experiment template. Deploy this stack in us-east-1 FIRST,
+  then deploy 02-secondary-region.yaml in ap-south-1.
+
+Parameters:
+  Engine:
+    Type: String
+    Default: aurora-postgresql
+    AllowedValues: [aurora-postgresql, aurora-mysql]
+    Description: Aurora engine to test.
+  EngineVersion:
+    Type: String
+    Default: '15.15'
+    Description: >-
+      Engine version. Example PostgreSQL 15.15, or 8.0.mysql_aurora.3.08.0 for
+      MySQL. Must support Global Database. Check with
+      aws rds describe-db-engine-versions.
+  DBPort:
+    Type: Number
+    Default: 5432
+    AllowedValues: [5432, 3306]
+    Description: 5432 for Aurora PostgreSQL, 3306 for Aurora MySQL.
+  DBInstanceClass:
+    Type: String
+    Default: db.r6g.large
+    Description: >-
+      Global Database requires memory-optimized (R-family) classes. Burstable
+      classes such as db.t4g are not supported.
+  GlobalClusterId:
+    Type: String
+    Default: dbblog-5791-global
+  MasterUsername:
+    Type: String
+    Default: postgres
+    Description: Use "postgres" for PostgreSQL or "admin" for MySQL.
+  LatestAl2023Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI (resolved from SSM Parameter Store).
+
+Resources:
+
+  # ---------- Networking ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: dbblog-5791-primary }]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: dbblog-5791-primary-a }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{ Key: Name, Value: dbblog-5791-primary-b }]
+  PrivateSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.3.0/24
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags: [{ Key: Name, Value: dbblog-5791-primary-c }]
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: dbblog-5791-primary-rtb }]
+  RouteAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable }
+  RouteAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable }
+  RouteAssocC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetC, RouteTableId: !Ref PrivateRouteTable }
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: dbblog-5791-primary-subnets
+      DBSubnetGroupDescription: DBBLOG-5791 primary
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+
+  # ---------- Security groups ----------
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: dbblog-5791-primary-db-sg
+      GroupDescription: Aurora primary DB - allow DB port within the VPC CIDR only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref DBPort
+          ToPort: !Ref DBPort
+          CidrIp: 10.42.0.0/16
+      Tags: [{ Key: Name, Value: dbblog-5791-primary-db-sg }]
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: dbblog-5791-vpce-sg
+      GroupDescription: SSM interface endpoints - allow HTTPS from the VPC CIDR
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.42.0.0/16
+      Tags: [{ Key: Name, Value: dbblog-5791-vpce-sg }]
+
+  # ---------- VPC endpoints (SSM x3 + S3 gateway) ----------
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PrivateDnsEnabled: true
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PrivateDnsEnabled: true
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PrivateDnsEnabled: true
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcId: !Ref Vpc
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  # ---------- IAM: SSM-managed access instance ----------
+  SsmInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dbblog-5791-ssm-ec2-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  SsmInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: dbblog-5791-ssm-ec2-profile
+      Roles: [!Ref SsmInstanceRole]
+
+  SeedInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAl2023Ami
+      InstanceType: t3.micro
+      IamInstanceProfile: !Ref SsmInstanceProfile
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroupIds: [!Ref DBSecurityGroup]
+      Tags: [{ Key: Name, Value: dbblog-5791-seed }]
+
+  # ---------- Aurora global + primary cluster ----------
+  GlobalCluster:
+    Type: AWS::RDS::GlobalCluster
+    Properties:
+      GlobalClusterIdentifier: !Ref GlobalClusterId
+      Engine: !Ref Engine
+      EngineVersion: !Ref EngineVersion
+      StorageEncrypted: true
+
+  DBMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: DBBLOG-5791 Aurora primary cluster admin credentials
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${MasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'' '
+
+  DBMasterSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DBMasterSecret
+      TargetId: !Ref PrimaryCluster
+      TargetType: AWS::RDS::DBCluster
+
+  PrimaryCluster:
+    Type: AWS::RDS::DBCluster
+    DependsOn: GlobalCluster
+    Properties:
+      DBClusterIdentifier: dbblog-5791-primary
+      GlobalClusterIdentifier: !Ref GlobalClusterId
+      Engine: !Ref Engine
+      EngineVersion: !Ref EngineVersion
+      MasterUsername: !Ref MasterUsername
+      # RDS-managed master passwords are not supported for Aurora global
+      # databases, so the password is generated in Secrets Manager and resolved
+      # at deploy time. It never appears in the template or stack parameters.
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBMasterSecret}:SecretString:password}}'
+      StorageEncrypted: true
+      EnableIAMDatabaseAuthentication: true
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds: [!Ref DBSecurityGroup]
+
+  PrimaryInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: dbblog-5791-primary-instance-1
+      DBClusterIdentifier: !Ref PrimaryCluster
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: !Ref Engine
+      PubliclyAccessible: false
+
+  # ---------- AWS FIS role + experiment template ----------
+  FisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dbblog-5791-fis-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: fis.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: dbblog-5791-fis-nacl
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read-only describe calls do not support resource-level scoping.
+              - Sid: FisReadOnlyDescribe
+                Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkAcls
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                Resource: '*'
+              - Sid: CreateTagsOnNetworkAcl
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-acl/*
+                Condition:
+                  StringEquals:
+                    ec2:CreateAction: CreateNetworkAcl
+                    aws:RequestTag/managedByFIS: 'true'
+              - Sid: CreateNetworkAcl
+                Effect: Allow
+                Action: ec2:CreateNetworkAcl
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-acl/*
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/managedByFIS: 'true'
+              - Sid: CreateNetworkAclOnVpc
+                Effect: Allow
+                Action: ec2:CreateNetworkAcl
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${Vpc}
+              - Sid: DeleteNetworkAcl
+                Effect: Allow
+                Action:
+                  - ec2:CreateNetworkAclEntry
+                  - ec2:DeleteNetworkAcl
+                Resource:
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-acl/*
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${Vpc}
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/managedByFIS: 'true'
+              # No tag condition here: when the action ends, FIS calls this to
+              # restore each subnet's original (default, untagged) network ACL.
+              - Sid: ReplaceNetworkAclAssociation
+                Effect: Allow
+                Action: ec2:ReplaceNetworkAclAssociation
+                Resource:
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnetA}
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnetB}
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnetC}
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-acl/*
+
+  DisruptExperimentTemplate:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: Disrupt connectivity to Aurora primary subnets
+      RoleArn: !GetAtt FisRole.Arn
+      StopConditions:
+        - Source: none
+      Actions:
+        DisruptPrimary:
+          ActionId: aws:network:disrupt-connectivity
+          Parameters: { scope: all, duration: PT6M }
+          Targets: { Subnets: primarySubnets }
+      Targets:
+        primarySubnets:
+          ResourceType: aws:ec2:subnet
+          ResourceArns:
+            - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnetA}
+            - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnetB}
+            - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnetC}
+          SelectionMode: ALL
+      Tags: { Name: dbblog-5791-disrupt }
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+  PrimaryClusterEndpoint:
+    Description: Writer endpoint of the primary cluster.
+    Value: !GetAtt PrimaryCluster.Endpoint.Address
+  MasterUserSecretArn:
+    Description: Secrets Manager ARN holding the cluster admin credentials.
+    Value: !Ref DBMasterSecret
+  SeedInstanceId:
+    Description: SSM-managed access instance. Connect with aws ssm start-session.
+    Value: !Ref SeedInstance
+  FisExperimentTemplateId:
+    Description: Pass this to aws fis start-experiment in Step 5.
+    Value: !Ref DisruptExperimentTemplate
+  GlobalClusterId:
+    Value: !Ref GlobalClusterId
